@@ -13,7 +13,10 @@ use itertools::Itertools;
 use std::{env::var, marker::PhantomData, vec};
 
 const KECCAK_WIDTH: usize = 5 * 5 * 64;
+const KECCAK_RATE: usize = 1088;
+
 const C_WIDTH: usize = 5 * 64;
+
 const RHOM: [[usize; 5]; 5] = [
     [0, 36, 3, 41, 18],
     [1, 44, 10, 45, 2],
@@ -76,6 +79,11 @@ pub(crate) struct KeccakRow {
     c_bits: [u8; C_WIDTH],
     a_bits: [u8; KECCAK_WIDTH / 25],
     q_end: u64,
+
+    // padding
+    // s_flags: [bool; KECCAK_RATE / 8],
+    d_bits: [u8; KECCAK_RATE],
+
 }
 
 /// KeccakConfig
@@ -90,6 +98,11 @@ pub struct KeccakBitConfig<F> {
     a_bits: [Column<Advice>; KECCAK_WIDTH / 25],
     iota_bits: [Column<Fixed>; IOTA_ROUND_BIT_POS.len()],
     c_table: Vec<TableColumn>,
+
+    // padding
+    // s_flags: [Column<Advice>; KECCAK_RATE / 8],
+    d_bits: [Column<Advice>; KECCAK_RATE],
+
     _marker: PhantomData<F>,
 }
 
@@ -148,6 +161,8 @@ impl<F: Field> KeccakBitConfig<F> {
         for _ in 0..1 + num_bits_per_theta_lookup {
             c_table.push(meta.lookup_table_column());
         }
+
+        let d_bits = [(); KECCAK_RATE].map(|_| meta.advice_column());
 
         let mut b = vec![vec![vec![0u64.expr(); 64]; 5]; 5];
         let mut b_next = vec![vec![vec![0u64.expr(); 64]; 5]; 5];
@@ -260,6 +275,11 @@ impl<F: Field> KeccakBitConfig<F> {
                 }
             }
 
+            for data_bit in d_bits {
+                let b = meta.query_advice(data_bit, Rotation::cur());
+                cb.require_boolean("input data bit", b);
+            }
+
             // Absorb bits
             for a in &a {
                 cb.require_boolean("boolean state bit", a.clone());
@@ -330,8 +350,8 @@ impl<F: Field> KeccakBitConfig<F> {
 
             let absorb_positions = get_absorb_positions();
             let mut a_slice = 0;
-            for j in 0..5 {
-                for i in 0..5 {
+            for i in 0..5 {
+                for j in 0..5 {
                     if absorb_positions.contains(&(i, j)) {
                         for k in 0..64 {
                             cb.require_equal(
@@ -371,6 +391,7 @@ impl<F: Field> KeccakBitConfig<F> {
             a_bits,
             iota_bits,
             c_table,
+            d_bits,
             _marker: PhantomData,
         }
     }
@@ -389,6 +410,7 @@ impl<F: Field> KeccakBitConfig<F> {
                         &mut region,
                         offset,
                         keccak_row.q_end,
+                        keccak_row.d_bits,
                         keccak_row.s_bits,
                         keccak_row.c_bits,
                         keccak_row.a_bits,
@@ -404,6 +426,7 @@ impl<F: Field> KeccakBitConfig<F> {
         region: &mut Region<'_, F>,
         offset: usize,
         q_end: u64,
+        d_bits: [u8; KECCAK_RATE],
         s_bits: [u8; KECCAK_WIDTH],
         c_bits: [u8; C_WIDTH],
         a_bits: [u8; KECCAK_WIDTH / 25],
@@ -433,6 +456,16 @@ impl<F: Field> KeccakBitConfig<F> {
             offset,
             || Ok(F::from(q_end)),
         )?;
+
+        // Input bits d_bits
+        for (idx, (bit, column)) in d_bits.iter().zip(self.d_bits.iter()).enumerate() {
+            region.assign_advice(
+                || format!("assign input data bit {} {}", idx, offset),
+                *column,
+                offset,
+                || Ok(F::from(*bit as u64)),
+            )?;
+        }
 
         // State bits
         for (idx, (bit, column)) in s_bits.iter().zip(self.s_bits.iter()).enumerate() {
@@ -518,8 +551,8 @@ impl<F: Field> KeccakBitConfig<F> {
 
 fn get_absorb_positions() -> Vec<(usize, usize)> {
     let mut absorb_positions = Vec::new();
-    for j in 0..5 {
-        for i in 0..5 {
+    for i in 0..5 {
+        for j in 0..5 {
             if i + j * 5 < 17 {
                 absorb_positions.push((i, j));
             }
@@ -530,15 +563,17 @@ fn get_absorb_positions() -> Vec<(usize, usize)> {
 
 fn keccak(bytes: Vec<u8>) -> Vec<KeccakRow> {
     let mut rows: Vec<KeccakRow> = Vec::new();
-
     let mut bits = into_bits(&bytes);
-    let rate: usize = 136 * 8;
+    let rate: usize = KECCAK_RATE;
 
+    // Absorb
     let mut b = [[[0u8; 64]; 5]; 5];
 
     let absorb_positions = get_absorb_positions();
 
-    // Padding
+    println!("bits {:?}", bits);
+    println!("bits.len() {:?}", bits.len());
+
     bits.push(1);
     while (bits.len() + 1) % rate != 0 {
         bits.push(0);
@@ -556,6 +591,14 @@ fn keccak(bytes: Vec<u8>) -> Vec<KeccakRow> {
                 b[i][j][k] ^= chunk[counter];
                 counter += 1;
             }
+        }
+
+        // Add d_bit to all 24 rounds + 1 absort round
+        let mut d_bits = [0; 136 * 8];
+        let mut counter = 0;
+        for d_bit in d_bits.iter_mut() {
+            *d_bit = chunk[counter];
+            counter += 1;
         }
 
         let mut counter = 0;
@@ -617,6 +660,7 @@ fn keccak(bytes: Vec<u8>) -> Vec<KeccakRow> {
                 c_bits,
                 a_bits,
                 q_end: q_end as u64,
+                d_bits: d_bits,
             });
 
             if round < 24 {
@@ -736,8 +780,14 @@ mod tests {
     #[test]
     fn bit_keccak_simple() {
         let k = 8;
-        let input = (0u8..136).collect::<Vec<_>>();
-        let inputs = keccak(input.to_vec());
+        let inputs = keccak(vec![1u8; 200]);
+        verify::<Fr>(k, inputs, true);
+    }
+
+    #[test]
+    fn bit_keccak_simple_padding() {
+        let k = 8;
+        let inputs = keccak(vec![1u8; 100]);
         verify::<Fr>(k, inputs, true);
     }
 }
