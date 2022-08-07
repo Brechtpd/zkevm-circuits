@@ -594,7 +594,7 @@ fn keccak(bytes: Vec<u8>) -> Vec<KeccakRow> {
         }
 
         // Add d_bit to all 24 rounds + 1 absort round
-        let mut d_bits = [0; 136 * 8];
+        let mut d_bits = [0; KECCAK_RATE];
         let mut counter = 0;
         for d_bit in d_bits.iter_mut() {
             *d_bit = chunk[counter];
