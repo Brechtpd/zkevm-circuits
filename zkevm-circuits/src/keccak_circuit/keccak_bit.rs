@@ -81,8 +81,10 @@ pub(crate) struct KeccakRow {
     q_end: u64,
 
     // padding
-    // s_flags: [bool; KECCAK_RATE / 8],
     d_bits: [u8; KECCAK_RATE],
+    d_lens: [u32; KECCAK_RATE / 8],
+    d_rlcs: [u8; KECCAK_RATE / 8],
+    s_flags: [bool; KECCAK_RATE / 8],
 
 }
 
@@ -100,8 +102,11 @@ pub struct KeccakBitConfig<F> {
     c_table: Vec<TableColumn>,
 
     // padding
-    // s_flags: [Column<Advice>; KECCAK_RATE / 8],
     d_bits: [Column<Advice>; KECCAK_RATE],
+    d_lens: [Column<Advice>; KECCAK_RATE / 8],
+    d_rlcs: [Column<Advice>; KECCAK_RATE / 8],
+    s_flags: [Column<Advice>; KECCAK_RATE / 8],
+    randomness: Column<Advice>,
 
     _marker: PhantomData<F>,
 }
@@ -163,6 +168,10 @@ impl<F: Field> KeccakBitConfig<F> {
         }
 
         let d_bits = [(); KECCAK_RATE].map(|_| meta.advice_column());
+        let d_lens = [(); KECCAK_RATE / 8].map(|_| meta.advice_column());
+        let d_rlcs = [(); KECCAK_RATE / 8].map(|_| meta.advice_column());
+        let s_flags = [(); KECCAK_RATE / 8].map(|_| meta.advice_column());
+        let randomness = meta.advice_column();
 
         let mut b = vec![vec![vec![0u64.expr(); 64]; 5]; 5];
         let mut b_next = vec![vec![vec![0u64.expr(); 64]; 5]; 5];
@@ -280,9 +289,75 @@ impl<F: Field> KeccakBitConfig<F> {
                 cb.require_boolean("input data bit", b);
             }
 
+            for s_flag in s_flags {
+                let s = meta.query_advice(s_flag, Rotation::cur());
+                cb.require_boolean("boolean state bit", s);
+            }
+
+            for i in 1..s_flags.len() {
+                let s_i = meta.query_advice(s_flags[i], Rotation::cur());
+                let s_i_sub1 = meta.query_advice(s_flags[i - 1], Rotation::cur());
+                cb.require_boolean("boolean state switch", s_i - s_i_sub1);
+            }
+
             // Absorb bits
             for a in &a {
                 cb.require_boolean("boolean state bit", a.clone());
+            }
+
+            cb.gate(meta.query_selector(q_enable))
+        });
+
+        meta.create_gate("padding bit checks", |meta| {
+            let mut cb = BaseConstraintBuilder::new(5);
+
+            for i in 1..s_flags.len() {
+                let s_i = meta.query_advice(s_flags[i], Rotation::cur());
+                let s_i_sub1 = meta.query_advice(s_flags[i - 1], Rotation::cur());
+                let d_bit_0 = meta.query_advice(d_bits[8 * i], Rotation::cur());
+                let s_padding_start = s_i - s_i_sub1;
+                cb.condition(s_padding_start, |cb| {
+                    cb.require_equal("start with 1", d_bit_0, 1u64.expr());
+                });
+            }
+            let s_last = meta.query_advice(s_flags[s_flags.len() - 1], Rotation::cur());
+            let d_last = meta.query_advice(d_bits[KECCAK_RATE - 1], Rotation::cur());
+
+            cb.condition(s_last, |cb| {
+                cb.require_equal("end with 1", d_last, 1u64.expr())
+            });
+            cb.gate(meta.query_selector(q_enable))
+        });
+
+        meta.create_gate("intermedium 0 checks", |meta| {
+            let mut cb = BaseConstraintBuilder::new(5);
+
+            let mut sum_padding_bits = 0u64.expr();
+            for i in 0..s_flags.len() {
+                let s_i = meta.query_advice(s_flags[i], Rotation::cur());
+                sum_padding_bits = d_bits[i * 8..(i + 1) * 8]
+                    .iter()
+                    .map(|b| meta.query_advice(*b, Rotation::cur()))
+                    .fold(sum_padding_bits, |sum, b| sum + s_i.clone() * b);
+            }
+
+            cb.require_equal("sum(padding_bits) == 2", sum_padding_bits, 2u64.expr());
+            cb.gate(meta.query_selector(q_enable))
+        });
+
+        meta.create_gate("input len check", |meta| {
+            let mut cb = BaseConstraintBuilder::new(5);
+
+            for i in 1..s_flags.len() {
+                let s_i = meta.query_advice(s_flags[i], Rotation::cur());
+                let len_i = meta.query_advice(d_lens[i], Rotation::cur());
+                let len_i_sub1 = meta.query_advice(d_lens[i - 1], Rotation::cur());
+
+                cb.require_equal(
+                    "len[i] = len[i-1] + !s_i",
+                    len_i,
+                    len_i_sub1 + not::expr(s_i),
+                );
             }
 
             cb.gate(meta.query_selector(q_enable))
@@ -392,6 +467,10 @@ impl<F: Field> KeccakBitConfig<F> {
             iota_bits,
             c_table,
             d_bits,
+            d_lens,
+            d_rlcs,
+            s_flags,
+            randomness,
             _marker: PhantomData,
         }
     }
@@ -410,10 +489,14 @@ impl<F: Field> KeccakBitConfig<F> {
                         &mut region,
                         offset,
                         keccak_row.q_end,
-                        keccak_row.d_bits,
                         keccak_row.s_bits,
                         keccak_row.c_bits,
                         keccak_row.a_bits,
+                        keccak_row.d_bits,
+                        keccak_row.d_lens,
+                        keccak_row.d_rlcs,
+                        keccak_row.s_flags,
+                        KeccakBitCircuit::r()
                     )?;
                 }
                 Ok(())
@@ -426,10 +509,14 @@ impl<F: Field> KeccakBitConfig<F> {
         region: &mut Region<'_, F>,
         offset: usize,
         q_end: u64,
-        d_bits: [u8; KECCAK_RATE],
         s_bits: [u8; KECCAK_WIDTH],
         c_bits: [u8; C_WIDTH],
         a_bits: [u8; KECCAK_WIDTH / 25],
+        d_bits: [u8; KECCAK_RATE],
+        d_lens: [u32; KECCAK_RATE / 8],
+        d_rlcs: [u8; KECCAK_RATE / 8],
+        s_flags: [bool; KECCAK_RATE / 8],
+        randomness: F,
     ) -> Result<(), Error> {
         let round = offset % 25;
 
@@ -466,6 +553,32 @@ impl<F: Field> KeccakBitConfig<F> {
                 || Ok(F::from(*bit as u64)),
             )?;
         }
+
+        // padding
+        for (idx, (s_flag, column)) in s_flags.iter().zip(self.s_flags.iter()).enumerate() {
+            region.assign_advice(
+                || format!("assign input data select flag {} {}", idx, offset),
+                *column,
+                offset,
+                || Ok(F::from(*s_flag as u64)),
+            )?;
+        }
+
+        for (idx, (d_len, column)) in d_lens.iter().zip(self.d_lens.iter()).enumerate() {
+            region.assign_advice(
+                || format!("assign input data len {} {}", idx, offset),
+                *column,
+                offset,
+                || Ok(F::from(*d_len as u64)),
+            )?;
+        }
+
+        region.assign_advice(
+            || format!("assign randomness{}", offset),
+            self.randomness,
+            offset,
+            || Ok(randomness),
+        )?;
 
         // State bits
         for (idx, (bit, column)) in s_bits.iter().zip(self.s_bits.iter()).enumerate() {
@@ -564,23 +677,25 @@ fn get_absorb_positions() -> Vec<(usize, usize)> {
 fn keccak(bytes: Vec<u8>) -> Vec<KeccakRow> {
     let mut rows: Vec<KeccakRow> = Vec::new();
     let mut bits = into_bits(&bytes);
-    let rate: usize = KECCAK_RATE;
 
     // Absorb
     let mut b = [[[0u8; 64]; 5]; 5];
 
     let absorb_positions = get_absorb_positions();
 
-    println!("bits {:?}", bits);
-    println!("bits.len() {:?}", bits.len());
+    let keccak_rate_in_bytes = KECCAK_RATE / 8;
+    let data_len = bits.len();
 
     bits.push(1);
-    while (bits.len() + 1) % rate != 0 {
+    while (bits.len() + 1) % KECCAK_RATE != 0 {
         bits.push(0);
     }
     bits.push(1);
 
-    let chunks = bits.chunks(rate);
+    println!("bits {:?}", bits);
+    println!("data_len {:?}, bits.len() {:?}", data_len, bits.len());
+
+    let chunks = bits.chunks(KECCAK_RATE);
     let num_chunks = chunks.len();
     println!("num_chunks: {}", num_chunks);
     for (idx, chunk) in chunks.enumerate() {
@@ -593,18 +708,47 @@ fn keccak(bytes: Vec<u8>) -> Vec<KeccakRow> {
             }
         }
 
+        let data_len_offset = (data_len / 8 % keccak_rate_in_bytes) as u32;
+        let data_len_base = ((data_len / 8 / keccak_rate_in_bytes) * keccak_rate_in_bytes) as u32;
+        println!("data_len_offset {:?}", data_len_offset);
+        println!("data_len_base {:?}", data_len_base);
+
+        // padding
         // Add d_bit to all 24 rounds + 1 absort round
-        let mut d_bits = [0; KECCAK_RATE];
+        let mut d_bits = [0u8; KECCAK_RATE];
+        let mut d_lens = [0u32; KECCAK_RATE / 8];
+        let d_rlcs = [0u8; KECCAK_RATE / 8];
+        let mut s_flags = [false; KECCAK_RATE / 8];
+
         let mut counter = 0;
         for d_bit in d_bits.iter_mut() {
             *d_bit = chunk[counter];
             counter += 1;
         }
 
+        for i in 0 as usize..(KECCAK_RATE / 8) {
+            if i == 0 {
+                s_flags[i] = data_len_offset == 0;
+                d_lens[i] = data_len_base + !s_flags[i] as u32;
+                continue
+            }
+
+            if (i as u32) < data_len_offset {
+                s_flags[i] = false;
+            } else {
+                s_flags[i] = true;
+            }
+
+            d_lens[i] = d_lens[i - 1] + !s_flags[i] as u32;
+        }
+
+        println!("s_flags {:?}", s_flags);
+        println!("d_lens {:?}", d_lens);
+
         let mut counter = 0;
         for (round, round_cst) in IOTA_ROUND_CST.iter().enumerate() {
             let mut a_bits = [0u8; 64];
-            if counter < rate {
+            if counter < KECCAK_RATE {
                 for a_bit in a_bits.iter_mut() {
                     *a_bit = chunk[counter];
                     counter += 1;
@@ -660,7 +804,10 @@ fn keccak(bytes: Vec<u8>) -> Vec<KeccakRow> {
                 c_bits,
                 a_bits,
                 q_end: q_end as u64,
-                d_bits: d_bits,
+                d_bits,
+                d_lens,
+                d_rlcs,
+                s_flags,
             });
 
             if round < 24 {
